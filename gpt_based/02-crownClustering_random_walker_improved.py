@@ -1,16 +1,23 @@
-import numpy as np
-import torch.nn.functional as F
-import math
-from torchvision import transforms
-import torch
-import cv2
-from typing import Dict, List, Sequence, Tuple
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from pathlib import Path
+"""
+Tree Crown Detection Pipeline (refactored)
+=========================================
+Main fixes applied:
+- removes duplicate imports / duplicate function definitions
+- fixes seed coordinate bug: sampling returns (x, y), propagation expects (row, col)
+- removes hard-coded label==15 visualization bug
+- removes hard-coded IMG_H/IMG_W reshapes; uses actual image shapes
+- validates I/O and empty-intermediate cases
+- makes caching deterministic and output-dir aware
+- uses faster random-walker propagation by default instead of NetworkX Dijkstra
+- keeps channel ordering explicit: [blue, green, red, red_edge, nir]
+"""
 
-from typing import Dict, List, Sequence, Tuple
+from __future__ import annotations
+
+import argparse
 import math
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
 
 import cv2
 import matplotlib.pyplot as plt
@@ -23,7 +30,21 @@ from skimage.feature import peak_local_max
 from skimage.segmentation import random_walker
 from tqdm import tqdm
 
-# matplotlib.use('agg')
+import tensorly as tl
+
+from tensorly.decomposition import tucker
+
+from model import CountRegressor, Resnet50FPN
+from utils import (
+    MAPS,
+    MincountLoss,
+    PerturbationLoss,
+    Scales,
+    Transform,
+    extract_features,
+    format_for_plotting,
+)
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -33,527 +54,115 @@ CHANNELS = ("blue", "green", "red", "red_edge", "nir")
 FILE_BANDS = ("b", "g", "r", "rEd", "nir")
 DATES = ("2020_11_21_1", "2020_11_21_2", "2020_11_22_1")
 
-MAPS = ["map3", "map4"]
-Scales = [0.9, 1.1]
-MIN_HW = 384
-MAX_HW = 1584
-IM_NORM_MEAN = [0.485, 0.456, 0.406]
-IM_NORM_STD = [0.229, 0.224, 0.225]
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
-def select_exemplar_rois(image):
-    all_rois = []
-
-    print(
-        "Press 'q' or Esc to quit. Press 'n' and then use mouse drag to draw a new examplar, 'space' to save."
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Tree crown detection pipeline")
+    p.add_argument(
+        "--data-root",
+        type=str,
+        required=True,
+        help="Directory containing multispectral TIFFs",
     )
-    while True:
-        key = cv2.waitKey(1) & 0xFF
-        if key == 27 or key == ord("q"):
-            break
-        elif key == ord("n") or key == "\r":
-            rect = cv2.selectROI("image", image, False, False)
-            x1 = rect[0]
-            y1 = rect[1]
-            x2 = x1 + rect[2] - 1
-            y2 = y1 + rect[3] - 1
-
-            all_rois.append([y1, x1, y2, x2])
-            for rect in all_rois:
-                y1, x1, y2, x2 = rect
-                cv2.rectangle(image, (x1, y1), (x2, y2), (255, 0, 0), 2)
-            print(
-                "Press q or Esc to quit. Press 'n' and then use mouse drag to draw a new examplar"
-            )
-
-    return all_rois
-
-
-def matlab_style_gauss2D(shape=(3, 3), sigma=0.5):
-    """
-    2D gaussian mask - should give the same result as MATLAB's
-    fspecial('gaussian',[shape],[sigma])
-    """
-    m, n = [(ss - 1.0) / 2.0 for ss in shape]
-    y, x = np.ogrid[-m : m + 1, -n : n + 1]
-    h = np.exp(-(x * x + y * y) / (2.0 * sigma * sigma))
-    h[h < np.finfo(h.dtype).eps * h.max()] = 0
-    sumh = h.sum()
-    if sumh != 0:
-        h /= sumh
-    return h
-
-
-def PerturbationLoss(output, boxes, sigma=8, use_gpu=True):
-    Loss = 0.0
-    if boxes.shape[1] > 1:
-        boxes = boxes.squeeze()
-        for tempBoxes in boxes.squeeze():
-            y1 = int(tempBoxes[1])
-            y2 = int(tempBoxes[3])
-            x1 = int(tempBoxes[2])
-            x2 = int(tempBoxes[4])
-            out = output[:, :, y1:y2, x1:x2]
-            GaussKernel = matlab_style_gauss2D(
-                shape=(out.shape[2], out.shape[3]), sigma=sigma
-            )
-            GaussKernel = torch.from_numpy(GaussKernel).float()
-            if use_gpu:
-                GaussKernel = GaussKernel.cuda()
-            Loss += F.mse_loss(out.squeeze(), GaussKernel)
-    else:
-        boxes = boxes.squeeze()
-        y1 = int(boxes[1])
-        y2 = int(boxes[3])
-        x1 = int(boxes[2])
-        x2 = int(boxes[4])
-        out = output[:, :, y1:y2, x1:x2]
-        Gauss = matlab_style_gauss2D(shape=(out.shape[2], out.shape[3]), sigma=sigma)
-        GaussKernel = torch.from_numpy(Gauss).float()
-        if use_gpu:
-            GaussKernel = GaussKernel.cuda()
-        Loss += F.mse_loss(out.squeeze(), GaussKernel)
-    return Loss
-
-
-def MincountLoss(output, boxes, use_gpu=True):
-    ones = torch.ones(1)
-    if use_gpu:
-        ones = ones.cuda()
-    Loss = 0.0
-    if boxes.shape[1] > 1:
-        boxes = boxes.squeeze()
-        for tempBoxes in boxes.squeeze():
-            y1 = int(tempBoxes[1])
-            y2 = int(tempBoxes[3])
-            x1 = int(tempBoxes[2])
-            x2 = int(tempBoxes[4])
-            X = output[:, :, y1:y2, x1:x2].sum()
-            if X.item() <= 1:
-                Loss += F.mse_loss(X, ones)
-    else:
-        boxes = boxes.squeeze()
-        y1 = int(boxes[1])
-        y2 = int(boxes[3])
-        x1 = int(boxes[2])
-        x2 = int(boxes[4])
-        X = output[:, :, y1:y2, x1:x2].sum()
-        if X.item() <= 1:
-            Loss += F.mse_loss(X, ones)
-    return Loss
-
-
-def pad_to_size(feat, desire_h, desire_w):
-    """zero-padding a four dim feature matrix: N*C*H*W so that the new Height and Width are the desired ones
-    desire_h and desire_w should be largers than the current height and weight
-    """
-
-    cur_h = feat.shape[-2]
-    cur_w = feat.shape[-1]
-
-    left_pad = (desire_w - cur_w + 1) // 2
-    right_pad = (desire_w - cur_w) - left_pad
-    top_pad = (desire_h - cur_h + 1) // 2
-    bottom_pad = (desire_h - cur_h) - top_pad
-
-    return F.pad(feat, (left_pad, right_pad, top_pad, bottom_pad))
-
-
-def extract_features(
-    feature_model,
-    image,
-    boxes,
-    feat_map_keys=["map3", "map4"],
-    exemplar_scales=[0.9, 1.1],
-):
-    N, M = image.shape[0], boxes.shape[2]
-    """
-    Getting features for the image N * C * H * W
-    """
-    Image_features = feature_model(image)
-    """
-    Getting features for the examples (N*M) * C * h * w
-    """
-    for ix in range(0, N):
-        # boxes = boxes.squeeze(0)
-        boxes = boxes[ix][0]
-        cnter = 0
-        Cnter1 = 0
-        for keys in feat_map_keys:
-            image_features = Image_features[keys][ix].unsqueeze(0)
-            if keys == "map1" or keys == "map2":
-                Scaling = 4.0
-            elif keys == "map3":
-                Scaling = 8.0
-            elif keys == "map4":
-                Scaling = 16.0
-            else:
-                Scaling = 32.0
-            boxes_scaled = boxes / Scaling
-            boxes_scaled[:, 1:3] = torch.floor(boxes_scaled[:, 1:3])
-            boxes_scaled[:, 3:5] = torch.ceil(boxes_scaled[:, 3:5])
-            boxes_scaled[:, 3:5] = (
-                boxes_scaled[:, 3:5] + 1
-            )  # make the end indices exclusive
-            feat_h, feat_w = image_features.shape[-2], image_features.shape[-1]
-            # make sure exemplars don't go out of bound
-            boxes_scaled[:, 1:3] = torch.clamp_min(boxes_scaled[:, 1:3], 0)
-            boxes_scaled[:, 3] = torch.clamp_max(boxes_scaled[:, 3], feat_h)
-            boxes_scaled[:, 4] = torch.clamp_max(boxes_scaled[:, 4], feat_w)
-            box_hs = boxes_scaled[:, 3] - boxes_scaled[:, 1]
-            box_ws = boxes_scaled[:, 4] - boxes_scaled[:, 2]
-            max_h = math.ceil(max(box_hs))
-            max_w = math.ceil(max(box_ws))
-            for j in range(0, M):
-                y1, x1 = int(boxes_scaled[j, 1]), int(boxes_scaled[j, 2])
-                y2, x2 = int(boxes_scaled[j, 3]), int(boxes_scaled[j, 4])
-                # print(y1,y2,x1,x2,max_h,max_w)
-                if j == 0:
-                    examples_features = image_features[:, :, y1:y2, x1:x2]
-                    if (
-                        examples_features.shape[2] != max_h
-                        or examples_features.shape[3] != max_w
-                    ):
-                        # examples_features = pad_to_size(examples_features, max_h, max_w)
-                        examples_features = F.interpolate(
-                            examples_features, size=(max_h, max_w), mode="bilinear"
-                        )
-                else:
-                    feat = image_features[:, :, y1:y2, x1:x2]
-                    if feat.shape[2] != max_h or feat.shape[3] != max_w:
-                        feat = F.interpolate(feat, size=(max_h, max_w), mode="bilinear")
-                        # feat = pad_to_size(feat, max_h, max_w)
-                    examples_features = torch.cat((examples_features, feat), dim=0)
-            """
-            Convolving example features over image features
-            """
-            h, w = examples_features.shape[2], examples_features.shape[3]
-            features = F.conv2d(
-                F.pad(
-                    image_features,
-                    ((int(w / 2)), int((w - 1) / 2), int(h / 2), int((h - 1) / 2)),
-                ),
-                examples_features,
-            )
-            combined = features.permute([1, 0, 2, 3])
-            # computing features for scales 0.9 and 1.1
-            for scale in exemplar_scales:
-                h1 = math.ceil(h * scale)
-                w1 = math.ceil(w * scale)
-                if h1 < 1:  # use original size if scaled size is too small
-                    h1 = h
-                if w1 < 1:
-                    w1 = w
-                examples_features_scaled = F.interpolate(
-                    examples_features, size=(h1, w1), mode="bilinear"
-                )
-                features_scaled = F.conv2d(
-                    F.pad(
-                        image_features,
-                        (
-                            (int(w1 / 2)),
-                            int((w1 - 1) / 2),
-                            int(h1 / 2),
-                            int((h1 - 1) / 2),
-                        ),
-                    ),
-                    examples_features_scaled,
-                )
-                features_scaled = features_scaled.permute([1, 0, 2, 3])
-                combined = torch.cat((combined, features_scaled), dim=1)
-            if cnter == 0:
-                Combined = 1.0 * combined
-            else:
-                if (
-                    Combined.shape[2] != combined.shape[2]
-                    or Combined.shape[3] != combined.shape[3]
-                ):
-                    combined = F.interpolate(
-                        combined,
-                        size=(Combined.shape[2], Combined.shape[3]),
-                        mode="bilinear",
-                    )
-                Combined = torch.cat((Combined, combined), dim=1)
-            cnter += 1
-        if ix == 0:
-            All_feat = 1.0 * Combined.unsqueeze(0)
-        else:
-            All_feat = torch.cat((All_feat, Combined.unsqueeze(0)), dim=0)
-    return All_feat
-
-
-class resizeImage(object):
-    """
-    If either the width or height of an image exceed a specified value, resize the image so that:
-        1. The maximum of the new height and new width does not exceed a specified value
-        2. The new height and new width are divisible by 8
-        3. The aspect ratio is preserved
-    No resizing is done if both height and width are smaller than the specified value
-    By: Minh Hoai Nguyen (minhhoai@gmail.com)
-    """
-
-    def __init__(self, MAX_HW=1504):
-        self.max_hw = MAX_HW
-
-    def __call__(self, sample):
-        image, lines_boxes = sample["image"], sample["lines_boxes"]
-
-        W, H = image.size
-        if W > self.max_hw or H > self.max_hw:
-            scale_factor = float(self.max_hw) / max(H, W)
-            new_H = 8 * int(H * scale_factor / 8)
-            new_W = 8 * int(W * scale_factor / 8)
-            resized_image = transforms.Resize((new_H, new_W))(image)
-        else:
-            scale_factor = 1
-            resized_image = image
-
-        boxes = list()
-        for box in lines_boxes:
-            box2 = [int(k * scale_factor) for k in box]
-            y1, x1, y2, x2 = box2[0], box2[1], box2[2], box2[3]
-            boxes.append([0, y1, x1, y2, x2])
-
-        boxes = torch.Tensor(boxes).unsqueeze(0)
-        resized_image = Normalize(resized_image)
-        sample = {"image": resized_image, "boxes": boxes}
-        return sample
-
-
-class resizeImageWithGT(object):
-    """
-    If either the width or height of an image exceed a specified value, resize the image so that:
-        1. The maximum of the new height and new width does not exceed a specified value
-        2. The new height and new width are divisible by 8
-        3. The aspect ratio is preserved
-    No resizing is done if both height and width are smaller than the specified value
-    By: Minh Hoai Nguyen (minhhoai@gmail.com)
-    Modified by: Viresh
-    """
-
-    def __init__(self, MAX_HW=1504):
-        self.max_hw = MAX_HW
-
-    def __call__(self, sample):
-        image, lines_boxes, density = (
-            sample["image"],
-            sample["lines_boxes"],
-            sample["gt_density"],
-        )
-
-        W, H = image.size
-        if W > self.max_hw or H > self.max_hw:
-            scale_factor = float(self.max_hw) / max(H, W)
-            new_H = 8 * int(H * scale_factor / 8)
-            new_W = 8 * int(W * scale_factor / 8)
-            resized_image = transforms.Resize((new_H, new_W))(image)
-            resized_density = cv2.resize(density, (new_W, new_H))
-            orig_count = np.sum(density)
-            new_count = np.sum(resized_density)
-
-            if new_count > 0:
-                resized_density = resized_density * (orig_count / new_count)
-
-        else:
-            scale_factor = 1
-            resized_image = image
-            resized_density = density
-        boxes = list()
-        for box in lines_boxes:
-            box2 = [int(k * scale_factor) for k in box]
-            y1, x1, y2, x2 = box2[0], box2[1], box2[2], box2[3]
-            boxes.append([0, y1, x1, y2, x2])
-
-        boxes = torch.Tensor(boxes).unsqueeze(0)
-        resized_image = Normalize(resized_image)
-        resized_density = torch.from_numpy(resized_density).unsqueeze(0).unsqueeze(0)
-        sample = {"image": resized_image, "boxes": boxes, "gt_density": resized_density}
-        print("hola utils")
-        return sample
-
-
-Normalize = transforms.Compose(
-    [transforms.ToTensor(), transforms.Normalize(mean=IM_NORM_MEAN, std=IM_NORM_STD)]
-)
-Transform = transforms.Compose([resizeImage(MAX_HW)])
-TransformTrain = transforms.Compose([resizeImageWithGT(MAX_HW)])
-
-
-def denormalize(tensor, means=IM_NORM_MEAN, stds=IM_NORM_STD):
-    """Reverses the normalisation on a tensor.
-    Performs a reverse operation on a tensor, so the pixel value range is
-    between 0 and 1. Useful for when plotting a tensor into an image.
-    Normalisation: (image - mean) / std
-    Denormalisation: image * std + mean
-    Args:
-        tensor (torch.Tensor, dtype=torch.float32): Normalized image tensor
-    Shape:
-        Input: :math:`(N, C, H, W)`
-        Output: :math:`(N, C, H, W)` (same shape as input)
-    Return:
-        torch.Tensor (torch.float32): Demornalised image tensor with pixel
-            values between [0, 1]
-    Note:
-        Symbols used to describe dimensions:
-            - N: number of images in a batch
-            - C: number of channels
-            - H: height of the image
-            - W: width of the image
-    """
-
-    denormalized = tensor.clone()
-
-    for channel, mean, std in zip(denormalized, means, stds):
-        channel.mul_(std).add_(mean)
-
-    return denormalized
-
-
-def scale_and_clip(val, scale_factor, min_val, max_val):
-    "Helper function to scale a value and clip it within range"
-
-    new_val = int(round(val * scale_factor))
-    new_val = max(new_val, min_val)
-    new_val = min(new_val, max_val)
-    return new_val
-
-
-def visualize_output_and_save(
-    input_, output, boxes, save_path, figsize=(20, 12), dots=None
-):
-    """
-    dots: Nx2 numpy array for the ground truth locations of the dot annotation
-        if dots is None, this information is not available
-    """
-
-    # get the total count
-    pred_cnt = output.sum().item()
-    boxes = boxes.squeeze(0)
-
-    boxes2 = []
-    for i in range(0, boxes.shape[0]):
-        y1, x1, y2, x2 = (
-            int(boxes[i, 1].item()),
-            int(boxes[i, 2].item()),
-            int(boxes[i, 3].item()),
-            int(boxes[i, 4].item()),
-        )
-        roi_cnt = output[0, 0, y1:y2, x1:x2].sum().item()
-        boxes2.append([y1, x1, y2, x2, roi_cnt])
-
-    img1 = format_for_plotting(denormalize(input_))
-    output = format_for_plotting(output)
-
-    fig = plt.figure(figsize=figsize)
-
-    # display the input image
-    ax = fig.add_subplot(2, 2, 1)
-    ax.set_axis_off()
-    ax.imshow(img1)
-
-    for bbox in boxes2:
-        y1, x1, y2, x2 = bbox[0], bbox[1], bbox[2], bbox[3]
-        rect = patches.Rectangle(
-            (x1, y1), x2 - x1, y2 - y1, linewidth=3, edgecolor="y", facecolor="none"
-        )
-        rect2 = patches.Rectangle(
-            (x1, y1),
-            x2 - x1,
-            y2 - y1,
-            linewidth=1,
-            edgecolor="k",
-            linestyle="--",
-            facecolor="none",
-        )
-        ax.add_patch(rect)
-        ax.add_patch(rect2)
-
-    if dots is not None:
-        ax.scatter(dots[:, 0], dots[:, 1], c="red", edgecolors="blue")
-        # ax.scatter(dots[:,0], dots[:,1], c='black', marker='+')
-        ax.set_title("Input image, gt count: {}".format(dots.shape[0]))
-    else:
-        ax.set_title("Input image")
-
-    ax = fig.add_subplot(2, 2, 2)
-    ax.set_axis_off()
-    ax.set_title("Overlaid result, predicted count: {:.2f}".format(pred_cnt))
-
-    img2 = 0.2989 * img1[:, :, 0] + 0.5870 * img1[:, :, 1] + 0.1140 * img1[:, :, 2]
-    ax.imshow(img2, cmap="gray")
-    ax.imshow(output, cmap=plt.cm.viridis, alpha=0.5)
-
-    # display the density map
-    ax = fig.add_subplot(2, 2, 3)
-    ax.set_axis_off()
-    ax.set_title("Density map, predicted count: {:.2f}".format(pred_cnt))
-    ax.imshow(output)
-    # plt.colorbar()
-
-    ax = fig.add_subplot(2, 2, 4)
-    ax.set_axis_off()
-    ax.set_title("Density map, predicted count: {:.2f}".format(pred_cnt))
-    ret_fig = ax.imshow(output)
-    for bbox in boxes2:
-        y1, x1, y2, x2, roi_cnt = bbox[0], bbox[1], bbox[2], bbox[3], bbox[4]
-        rect = patches.Rectangle(
-            (x1, y1), x2 - x1, y2 - y1, linewidth=3, edgecolor="y", facecolor="none"
-        )
-        rect2 = patches.Rectangle(
-            (x1, y1),
-            x2 - x1,
-            y2 - y1,
-            linewidth=1,
-            edgecolor="k",
-            linestyle="--",
-            facecolor="none",
-        )
-        ax.add_patch(rect)
-        ax.add_patch(rect2)
-        ax.text(x1, y1, "{:.2f}".format(roi_cnt), backgroundcolor="y")
-
-    fig.colorbar(ret_fig, ax=ax)
-
-    fig.savefig(save_path, bbox_inches="tight")
-    plt.close()
-
-
-def format_for_plotting(tensor):
-    """Formats the shape of tensor for plotting.
-    Tensors typically have a shape of :math:`(N, C, H, W)` or :math:`(C, H, W)`
-    which is not suitable for plotting as images. This function formats an
-    input tensor :math:`(H, W, C)` for RGB and :math:`(H, W)` for mono-channel
-    data.
-    Args:
-        tensor (torch.Tensor, torch.float32): Image tensor
-    Shape:
-        Input: :math:`(N, C, H, W)` or :math:`(C, H, W)`
-        Output: :math:`(H, W, C)` or :math:`(H, W)`, respectively
-    Return:
-        torch.Tensor (torch.float32): Formatted image tensor (detached)
-    Note:
-        Symbols used to describe dimensions:
-            - N: number of images in a batch
-            - C: number of channels
-            - H: height of the image
-            - W: width of the image
-    """
-
-    has_batch_dimension = len(tensor.shape) == 4
-    formatted = tensor.clone()
-
-    if has_batch_dimension:
-        formatted = tensor.squeeze(0)
-
-    if formatted.shape[0] == 1:
-        return formatted.squeeze(0).detach()
-    else:
-        return formatted.permute(1, 2, 0).detach()
+    p.add_argument(
+        "--output-dir", type=str, default="./output", help="Output directory"
+    )
+    p.add_argument(
+        "--model-path", type=str, default="./data/pretrainedModels/FamNet_Save1.pth"
+    )
+    p.add_argument("--gpu-id", type=int, default=0, help="GPU id; -1 = CPU")
+    p.add_argument("--adapt", action="store_true", help="Run test-time adaptation")
+    p.add_argument("--gradient-steps", type=int, default=100)
+    p.add_argument("--learning-rate", type=float, default=1e-7)
+    p.add_argument("--weight-mincount", type=float, default=1e-9)
+    p.add_argument("--weight-perturbation", type=float, default=1e-4)
+    p.add_argument("--day-for-ranking", type=int, default=1, choices=range(len(DATES)))
+    p.add_argument(
+        "--day-for-propagation", type=int, default=0, choices=range(len(DATES))
+    )
+    p.add_argument(
+        "--crop",
+        type=int,
+        nargs=4,
+        metavar=("ROW0", "ROW1", "COL0", "COL1"),
+        default=(720, 1000, 420, 720),
+    )
+    p.add_argument("--top-k-blobs", type=int, default=5)
+    p.add_argument("--num-exemplars", type=int, default=30)
+    p.add_argument("--peak-min-distance", type=int, default=25)
+    p.add_argument("--peak-percentile", type=float, default=90.0)
+    p.add_argument("--neighborhood-radius", type=int, default=50)
+    p.add_argument(
+        "--ground-method",
+        type=str,
+        default="combined",
+        choices=["ndvi", "osavi", "msavi", "combined"],
+    )
+    p.add_argument("--rw-beta", type=float, default=600.0)
+    return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
 # Device / model helpers
 # ---------------------------------------------------------------------------
+
+
+def get_device(gpu_id: int) -> torch.device:
+    if gpu_id >= 0 and torch.cuda.is_available():
+        print(f"===> Using GPU {gpu_id}")
+        return torch.device(f"cuda:{gpu_id}")
+    print("===> Using CPU")
+    return torch.device("cpu")
+
+
+def load_models(model_path: str, device: torch.device):
+    weights_path = Path(model_path)
+    if not weights_path.exists():
+        raise FileNotFoundError(f"Model weights not found: {weights_path}")
+
+    resnet = Resnet50FPN().to(device).eval()
+    regressor = CountRegressor(6, pool="mean").to(device).eval()
+
+    state = torch.load(weights_path, map_location=device)
+    regressor.load_state_dict(state)
+    return resnet, regressor
+
+
+# ---------------------------------------------------------------------------
+# Data I/O
+# ---------------------------------------------------------------------------
+
+
+def _load_band(root: str, band: str, date: str) -> np.ndarray:
+    path = Path(root) / f"{band}_{date}.tif"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing band file: {path}")
+    return np.asarray(Image.open(path))
+
+
+def read_data(
+    root: str, dates: Sequence[str] = DATES, bands: Sequence[str] = FILE_BANDS
+) -> np.ndarray:
+    """Return array with shape (T, H, W, B)."""
+    tensors = []
+    for date in dates:
+        planes = [_load_band(root, band, date) for band in bands]
+        shapes = {arr.shape for arr in planes}
+        if len(shapes) != 1:
+            raise ValueError(f"Band shape mismatch for {date}: {sorted(shapes)}")
+        tensors.append(np.stack(planes, axis=-1))
+    return np.stack(tensors, axis=0)
+
+
+def crop_data(data: np.ndarray, crop: Sequence[int]) -> np.ndarray:
+    r0, r1, c0, c1 = map(int, crop)
+    if not (0 <= r0 < r1 <= data.shape[1] and 0 <= c0 < c1 <= data.shape[2]):
+        raise ValueError(f"Invalid crop {crop} for data shape {data.shape}")
+    return data[:, r0:r1, c0:c1, :]
 
 
 # ---------------------------------------------------------------------------
@@ -972,6 +581,286 @@ def build_cluster_neighborhood_masks(
 
     return masks.astype(bool)
 
+
+def propagate_labels_random_walker(
+    image: np.ndarray,
+    seed_clusters_rc: Sequence[np.ndarray],
+    vegetation_mask: np.ndarray,
+    beta: float = 100.0,
+    neighborhood_radius: int | None = None,
+    neighborhood_radii: Sequence[int | float] | None = None,
+    max_seeds_per_cluster: int | None = 64,
+    enforce_label_neighborhoods: bool = True,
+    crop_to_active_bbox: bool = True,
+    use_probability_constraints: bool = True,
+) -> np.ndarray:
+    """
+    Random-walker crown propagation constrained by vegetation and crown-local masks.
+
+    The propagation is intentionally conservative:
+      1. Pixels outside the vegetation mask are forbidden.
+      2. Pixels outside every crown neighborhood are forbidden.
+      3. Optional connected-component pruning removes active regions that contain no seed.
+      4. Optional per-label constraints prevent a crown label from occupying pixels
+         outside that crown's own neighborhood.
+      5. Optional active-domain cropping reduces the size of the random-walker solve.
+
+    Args:
+        image:
+            Array [H, W, C]. Multispectral or feature image used by random walker.
+
+        seed_clusters_rc:
+            List of K arrays. Each array contains seed points for one crown,
+            in (row, col) format.
+
+        vegetation_mask:
+            Boolean or uint8 array [H, W].
+            1 / True  = valid vegetation pixel.
+            0 / False = ground, shadow, background, or invalid pixel.
+
+        beta:
+            Random-walker beta parameter. Larger values make propagation more
+            sensitive to feature differences and usually produce sharper borders.
+
+        neighborhood_radius:
+            Optional global radius for all clusters.
+
+        neighborhood_radii:
+            Optional independent radius per cluster. Recommended: use radii
+            estimated by grow_peak_circles_until_collision(...).
+
+        max_seeds_per_cluster:
+            Optional cap on seed markers per crown. This reduces marker-count bias
+            when one crown has many more sampled seed points than another. Set to
+            None to use all valid seeds.
+
+        enforce_label_neighborhoods:
+            If True, a label can only be assigned inside its own neighborhood mask.
+            This is stronger than only restricting the global active domain.
+
+        crop_to_active_bbox:
+            If True, run random_walker only on the bounding box containing active
+            pixels. This can be much faster when neighborhoods occupy a small part
+            of the image.
+
+        use_probability_constraints:
+            If True and enforce_label_neighborhoods is True, request full random-
+            walker probabilities and select the best valid label per pixel after
+            masking invalid label/pixel pairs. This avoids simply deleting labels
+            after propagation and usually leaves fewer holes.
+
+    Returns:
+        labels:
+            Integer array [H, W].
+            0 = background / non-vegetation / forbidden.
+            1..K = propagated crown labels.
+    """
+    image = np.asarray(image, dtype=np.float32)
+    vegetation_mask = np.asarray(vegetation_mask).astype(bool)
+
+    if image.ndim != 3:
+        raise ValueError(f"Expected image shape [H, W, C], got {image.shape}")
+
+    h, w, _ = image.shape
+
+    if vegetation_mask.shape != (h, w):
+        raise ValueError(
+            f"vegetation_mask shape {vegetation_mask.shape} does not match image shape {(h, w)}"
+        )
+
+    n_clusters = len(seed_clusters_rc)
+    if n_clusters == 0:
+        return np.zeros((h, w), dtype=np.int32)
+
+    neighborhoods = build_cluster_neighborhood_masks(
+        image_shape=(h, w),
+        seed_clusters_rc=seed_clusters_rc,
+        neighborhood_radius=neighborhood_radius,
+        neighborhood_radii=neighborhood_radii,
+    )
+
+    if neighborhoods.shape != (n_clusters, h, w):
+        raise ValueError(
+            f"Expected neighborhoods shape {(n_clusters, h, w)}, got {neighborhoods.shape}"
+        )
+
+    # Global active domain: vegetation pixels that are inside at least one
+    # crown-local neighborhood. This keeps the random walker from solving over
+    # irrelevant background or distant canopy regions.
+    allowed = vegetation_mask & np.any(neighborhoods, axis=0)
+    if not np.any(allowed):
+        print("Warning: no allowed propagation pixels after applying masks.")
+        return np.zeros((h, w), dtype=np.int32)
+
+    markers = np.zeros((h, w), dtype=np.int32)
+    markers[~allowed] = -1
+
+    def _prepare_cluster_seeds(cluster: np.ndarray, cluster_allowed: np.ndarray) -> np.ndarray:
+        """Return valid, unique, optionally downsampled seed points for one crown."""
+        pts = np.asarray(cluster, dtype=np.int32)
+        if pts.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+        pts = pts.reshape(-1, 2)
+
+        in_bounds = (
+            (pts[:, 0] >= 0)
+            & (pts[:, 0] < h)
+            & (pts[:, 1] >= 0)
+            & (pts[:, 1] < w)
+        )
+        pts = pts[in_bounds]
+        if pts.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+
+        pts = pts[cluster_allowed[pts[:, 0], pts[:, 1]]]
+        if pts.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+
+        # Unique + sorted gives deterministic marker selection independent of
+        # accidental duplicate samples.
+        pts = np.unique(pts, axis=0)
+
+        if max_seeds_per_cluster is not None and len(pts) > max_seeds_per_cluster:
+            # Use a deterministic, spatially spread subset. Sorting by row/col
+            # and sampling evenly avoids the bias of simply taking the first N.
+            order = np.lexsort((pts[:, 1], pts[:, 0]))
+            pts = pts[order]
+            idx = np.linspace(0, len(pts) - 1, int(max_seeds_per_cluster), dtype=np.int32)
+            pts = pts[idx]
+
+        return pts.astype(np.int32, copy=False)
+
+    valid_label_ids: List[int] = []
+
+    for cluster_id, cluster in enumerate(seed_clusters_rc, start=1):
+        cluster_allowed = vegetation_mask & neighborhoods[cluster_id - 1]
+        pts = _prepare_cluster_seeds(cluster, cluster_allowed)
+        if len(pts) == 0:
+            continue
+
+        markers[pts[:, 0], pts[:, 1]] = cluster_id
+        valid_label_ids.append(cluster_id)
+
+    if len(valid_label_ids) == 0:
+        print("Warning: no valid seed points inside vegetation/neighborhood masks.")
+        return np.zeros((h, w), dtype=np.int32)
+
+    # Remove allowed connected components that contain no seed. This improves
+    # numerical conditioning, avoids meaningless unlabeled islands, and reduces
+    # the active solve size.
+    structure = ndi.generate_binary_structure(2, 1)
+    component_labels, _ = ndi.label(allowed, structure=structure)
+    seeded_components = np.unique(component_labels[markers > 0])
+    seeded_components = seeded_components[seeded_components > 0]
+
+    if len(seeded_components) == 0:
+        print("Warning: no seeded connected components in allowed mask.")
+        return np.zeros((h, w), dtype=np.int32)
+
+    reachable_allowed = np.isin(component_labels, seeded_components)
+    markers[allowed & ~reachable_allowed] = -1
+    allowed = allowed & reachable_allowed
+
+    data = normalize_channels(image)
+    data[~np.isfinite(data)] = 0.0
+
+    if crop_to_active_bbox:
+        active_rows, active_cols = np.where(allowed | (markers > 0))
+        r0 = int(active_rows.min())
+        r1 = int(active_rows.max()) + 1
+        c0 = int(active_cols.min())
+        c1 = int(active_cols.max()) + 1
+    else:
+        r0, r1, c0, c1 = 0, h, 0, w
+
+    row_slice = slice(r0, r1)
+    col_slice = slice(c0, c1)
+
+    data_crop = data[row_slice, col_slice, :]
+    markers_crop = markers[row_slice, col_slice]
+    neighborhoods_crop = neighborhoods[:, row_slice, col_slice]
+    vegetation_crop = vegetation_mask[row_slice, col_slice]
+
+    positive_labels = np.unique(markers_crop[markers_crop > 0]).astype(np.int32)
+    if len(positive_labels) == 0:
+        print("Warning: no valid seed points after active-domain cropping.")
+        return np.zeros((h, w), dtype=np.int32)
+
+    want_probabilities = enforce_label_neighborhoods and use_probability_constraints
+
+    def _run_random_walker(return_full_prob: bool):
+        last_error = None
+        for mode in ("cg_mg", "cg"):
+            try:
+                return random_walker(
+                    data_crop,
+                    markers_crop,
+                    beta=beta,
+                    mode=mode,
+                    channel_axis=-1,
+                    copy=True,
+                    return_full_prob=return_full_prob,
+                )
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError("random_walker failed in both cg_mg and cg modes") from last_error
+
+    if want_probabilities:
+        try:
+            probabilities = np.asarray(_run_random_walker(return_full_prob=True), dtype=np.float32)
+
+            # random_walker returns one probability plane per positive label,
+            # ordered by sorted label id. With labels 1..K this aligns with
+            # positive_labels, but we still keep the explicit mapping below.
+            if probabilities.shape[0] != len(positive_labels):
+                raise RuntimeError(
+                    "Unexpected probability output shape from random_walker: "
+                    f"{probabilities.shape}; expected first axis length {len(positive_labels)}."
+                )
+
+            label_neighborhoods = neighborhoods_crop[positive_labels - 1]
+            label_allowed = label_neighborhoods & vegetation_crop[None, :, :]
+
+            constrained_probabilities = probabilities.copy()
+            constrained_probabilities[~label_allowed] = -np.inf
+
+            has_candidate = np.any(label_allowed, axis=0) & (markers_crop != -1)
+            labels_crop = np.zeros(markers_crop.shape, dtype=np.int32)
+
+            if np.any(has_candidate):
+                best_idx = np.argmax(constrained_probabilities[:, has_candidate], axis=0)
+                labels_crop[has_candidate] = positive_labels[best_idx]
+
+            # Preserve seed labels exactly. This protects against rare numerical
+            # ties and documents the intended marker semantics.
+            seed_pixels = markers_crop > 0
+            labels_crop[seed_pixels] = markers_crop[seed_pixels]
+
+        except Exception as exc:
+            print(
+                "Warning: probability-constrained random walker failed; "
+                f"falling back to hard post-filtering. Details: {exc}"
+            )
+            rw = _run_random_walker(return_full_prob=False)
+            labels_crop = np.asarray(rw, dtype=np.int32)
+    else:
+        rw = _run_random_walker(return_full_prob=False)
+        labels_crop = np.asarray(rw, dtype=np.int32)
+
+    # Universal cleanup.
+    labels_crop[markers_crop == -1] = 0
+    labels_crop[~vegetation_crop] = 0
+
+    # Hard safety net: even when probability constraints are disabled or have
+    # fallen back, no label is allowed outside its own crown neighborhood.
+    if enforce_label_neighborhoods:
+        for label_id in positive_labels:
+            invalid = (labels_crop == label_id) & (~neighborhoods_crop[label_id - 1])
+            labels_crop[invalid] = 0
+
+    labels = np.zeros((h, w), dtype=np.int32)
+    labels[row_slice, col_slice] = labels_crop
+    return labels
 
 # ---------------------------------------------------------------------------
 # FamNet inference / adaptation
@@ -1497,3 +1386,187 @@ def compute_shadow_removal_mask(
     }
 
     return keep_mask.astype(np.uint8), debug
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    args = parse_args()
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    device = get_device(args.gpu_id)
+    resnet, regressor = load_models(args.model_path, device)
+
+    data = read_data(args.data_root)
+    data = crop_data(data, args.crop)
+    xn = normalize_per_band(data)
+
+    veg_indices = compute_vegetation_indices(xn)
+    cands_rank = build_candidate_features(xn, veg_indices, day=args.day_for_ranking)
+    cands_prop = build_candidate_features(xn, veg_indices, day=args.day_for_propagation)
+
+    masks = mask_bright_spots(cands_rank)
+    ranked = rank_candidates(cands_rank, masks, sort_by="contrast_ratio")
+    if not ranked:
+        raise RuntimeError("No candidate features could be ranked.")
+
+    best_name = ranked[0]["name"]
+    print(f"Best feature: {best_name}")
+
+    selected_mask, blob_info, contours = detect_big_round_blobs(masks[best_name])
+    _, contours = filter_border_contours(
+        selected_mask.shape, top_k_blobs(blob_info, contours, args.top_k_blobs)[1]
+    )
+    boxes, min_box_area = get_blob_bounding_boxes(contours)
+    if len(boxes) == 0:
+        raise RuntimeError("No valid exemplar blobs found after filtering.")
+
+    print(len(boxes))
+
+    # Realmente necesitamos famnet?
+    density_map = run_famnet(
+        cands_rank[best_name], boxes, resnet, regressor, False, args, device
+    )
+    density_smooth = ndi.gaussian_filter(density_map, sigma=3)
+    peaks_rc = detect_strong_peaks(
+        density_smooth,
+        min_distance=args.peak_min_distance,
+        percentile=args.peak_percentile,
+    )
+    est_count = int(np.rint(density_map.sum()))
+    print(f"Estimated crowns: {est_count} | detected peaks: {len(peaks_rc)}")
+    if len(peaks_rc) == 0:
+        raise RuntimeError("No peaks detected in density map.")
+
+    propagation_image = stack_feature_maps(cands_prop)
+    ranking_image = stack_feature_maps(cands_rank)
+    h, w = propagation_image.shape[:2]
+
+    vegetation_mask, _ = compute_ground_removal_mask(
+        propagation_image[:, :, 0:5],
+        method=args.ground_method,
+        use_otsu=True,
+        remove_shadow=True,
+    )
+    # plt.figure()
+    # plt.imshow(vegetation_mask)
+    # plt.figure()
+    # plt.imshow(propagation_image[:, :, 0:3])
+    # plt.show()
+    # os.exit()
+
+    circle_labels, circle_info, circle_debug = grow_peak_circles_until_collision(
+        peaks_rc=peaks_rc,
+        vegetation_mask=vegetation_mask,
+        max_intersection_frac=0.15,
+        radius_step=2,
+        initial_radius=3,
+    )
+
+    cluster_radii = np.asarray(
+        [info["radius"] for info in circle_info],
+        dtype=np.float32,
+    )
+
+    # Build the decomposition input from two distinct days instead of duplicating
+    # the same feature cube twice.
+    data_np = np.stack((propagation_image, ranking_image), axis=-1)
+
+    core, factors = tucker(data_np, rank=[h, w, 3, 1], verbose=2)
+
+    X_hat = tl.tucker_to_tensor((core, factors))  # reconstructed tensor
+
+    seed_clusters_rc: List[np.ndarray] = []
+    all_seed_points_rc: List[np.ndarray] = []
+    valid_cluster_radii: List[float] = []
+    valid_peaks_rc: List[Tuple[int, int]] = []
+
+    for i, (row, col) in enumerate(peaks_rc):
+        pts_xy = sample_points_in_circle_xy(
+            (float(col), float(row)),
+            min_box_area - 5,
+            args.num_exemplars,
+            (h, w),
+        )
+
+        pts_rc = xy_to_rc(pts_xy)
+        pts_rc[:, 0] = np.clip(pts_rc[:, 0], 0, h - 1)
+        pts_rc[:, 1] = np.clip(pts_rc[:, 1], 0, w - 1)
+
+        keep = vegetation_mask[pts_rc[:, 0], pts_rc[:, 1]] > 0
+        pts_rc = pts_rc[keep]
+
+        if len(pts_rc) == 0:
+            continue
+
+        seed_clusters_rc.append(pts_rc)
+        all_seed_points_rc.append(pts_rc)
+        valid_cluster_radii.append(float(cluster_radii[i]))
+        valid_peaks_rc.append((int(row), int(col)))
+
+    seed_points_rc = (
+        np.vstack(all_seed_points_rc)
+        if all_seed_points_rc
+        else np.empty((0, 2), dtype=np.int32)
+    )
+
+    valid_cluster_radii = np.asarray(valid_cluster_radii, dtype=np.float32)
+    valid_peaks_rc = np.asarray(valid_peaks_rc, dtype=np.int32)
+
+    plot_grown_circles_debug(
+        image_rgb=X_hat[:, :, 0:3, 0],
+        peaks_rc=peaks_rc,
+        labels=circle_labels,
+        circle_info=circle_info,
+        debug=circle_debug,
+    )
+
+    labels = propagate_labels_random_walker(
+        image=X_hat[:, :, 0:5, 0],
+        seed_clusters_rc=seed_clusters_rc,
+        vegetation_mask=vegetation_mask,
+        beta=args.rw_beta,
+        neighborhood_radius=None,
+        neighborhood_radii=valid_cluster_radii,
+    )
+
+    # for i_label in labels_unique:
+    #    if i_label == 0:
+    #        continue
+
+    #    mask = np.zeros((h, w))
+    #    mask[labels == i_label] = 255
+
+    #    result = segment_self_occluded_fruit_contour(mask)
+
+    #    fig, ax = plt.subplots()
+    #    ax.imshow(X_hat[:, :, 0:3, 0])
+
+    #    for segment in result.contour_segments_xy:
+
+    #        print(segment.shape)
+    #        ax = draw_contour(segment, ax, show_points=True)
+    #    #print(result)
+
+    #    plt.show()
+
+    #    print(i_label.shape)
+    #    print(i_label)
+    #    #os.exit()
+
+    # rgb = np.stack(
+    #    [cands_prop["Red"], cands_prop["Green"], cands_prop["Blue"]], axis=-1
+    # )
+    show_final_results(
+        cands_rank[best_name],
+        X_hat[:, :, 0, 0],  # density_smooth,
+        X_hat[:, :, 0:3, 0],
+        labels,
+        seed_points_rc,
+    )
+
+
+if __name__ == "__main__":
+    main()
