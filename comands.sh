@@ -11,6 +11,7 @@ python crownClustering_optimized_refactored.py \
   --input-mode rgb \
   --rgb-image-path ~/Data/Arauco/Samples/MSanz/RGB/RGB_subset.tif \
   --seed-source manual_centers \
+  --interactive-bboxes \
   --model-path ./data/pretrainedModels/FamNet_Save1.pth \
   --vegetation-mask-mode auto \
   --feature-reduction none \
@@ -19,4 +20,4 @@ python crownClustering_optimized_refactored.py \
   --output-dir output_rgb_density \
   --crop 720 1000 720 1000 --show 
 
-
+ python crownClustering_optimized_refactored.py   --input-mode rgb   --rgb-image-path ~/Data/Arauco/Samples/MSanz/RGB/RGB_subset.tif   --seed-source manual_centers   --interactive-bboxes   --model-path ./data/pretrainedModels/FamNet_Save1.pth   --vegetation-mask-mode auto   --feature-reduction none   --clustering-method watershed   --fallback-to-manual-centers   --output-dir output_rgb_density   --crop 720 1000 720 1000 --show

@@ -118,7 +118,9 @@ def stack_feature_maps(features: Mapping[str, np.ndarray]) -> np.ndarray:
     """Stack an ordered feature dictionary into an [H, W, C] cube."""
     if not features:
         raise ValueError("features cannot be empty")
-    return np.stack([np.asarray(v, dtype=np.float32) for v in features.values()], axis=-1)
+    return np.stack(
+        [np.asarray(v, dtype=np.float32) for v in features.values()], axis=-1
+    )
 
 
 # Backwards-compatible alias used by the previous pipeline.
@@ -187,7 +189,9 @@ def read_bbox_file(
     return [list(map(int, b)) for b in boxes]
 
 
-def write_bbox_file(boxes: Sequence[Sequence[int | float]], out_file: str | Path) -> None:
+def write_bbox_file(
+    boxes: Sequence[Sequence[int | float]], out_file: str | Path
+) -> None:
     """Write [y1 x1 y2 x2] boxes to a text file."""
     path = Path(out_file)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -312,7 +316,9 @@ def box_radius_estimates(
 # ---------------------------------------------------------------------------
 
 
-def matlab_style_gauss2D(shape: Tuple[int, int] = (3, 3), sigma: float = 0.5) -> np.ndarray:
+def matlab_style_gauss2D(
+    shape: Tuple[int, int] = (3, 3), sigma: float = 0.5
+) -> np.ndarray:
     """2D Gaussian mask compatible with MATLAB fspecial('gaussian')."""
     m, n = [(ss - 1.0) / 2.0 for ss in shape]
     y, x = np.ogrid[-m : m + 1, -n : n + 1]
@@ -333,7 +339,9 @@ def _iter_famnet_boxes(boxes: torch.Tensor) -> Iterable[torch.Tensor]:
             yield box
 
 
-def PerturbationLoss(output: torch.Tensor, boxes: torch.Tensor, sigma: int = 8, use_gpu: bool = True):
+def PerturbationLoss(
+    output: torch.Tensor, boxes: torch.Tensor, sigma: int = 8, use_gpu: bool = True
+):
     """Original FamNet perturbation loss, with safer box iteration."""
     loss = 0.0
     for temp_box in _iter_famnet_boxes(boxes):
@@ -471,7 +479,9 @@ Transform = Compose([resizeImage(MAX_HW)])
 TransformTrain = Compose([resizeImageWithGT(MAX_HW)])
 
 
-def denormalize(tensor: torch.Tensor, means=IM_NORM_MEAN, stds=IM_NORM_STD) -> torch.Tensor:
+def denormalize(
+    tensor: torch.Tensor, means=IM_NORM_MEAN, stds=IM_NORM_STD
+) -> torch.Tensor:
     """Reverse ImageNet normalization for plotting."""
     x = tensor.clone()
     if x.ndim == 4:
@@ -568,7 +578,15 @@ def extract_features(
                         example_features, size=(h_s, w_s), mode="bilinear"
                     )
                 response = F.conv2d(
-                    F.pad(feat, (int(w_s / 2), int((w_s - 1) / 2), int(h_s / 2), int((h_s - 1) / 2))),
+                    F.pad(
+                        feat,
+                        (
+                            int(w_s / 2),
+                            int((w_s - 1) / 2),
+                            int(h_s / 2),
+                            int((h_s - 1) / 2),
+                        ),
+                    ),
                     examples_scaled,
                 ).permute([1, 0, 2, 3])
                 level_responses.append(response)
@@ -588,7 +606,9 @@ def extract_features(
     return torch.cat(all_features, dim=0)
 
 
-def adapt_regressor(regressor, features: torch.Tensor, boxes: torch.Tensor, args, device: torch.device):
+def adapt_regressor(
+    regressor, features: torch.Tensor, boxes: torch.Tensor, args, device: torch.device
+):
     """Optional test-time adaptation for FamNet."""
     regressor.train()
     optimizer = optim.Adam(regressor.parameters(), lr=float(args.learning_rate))
@@ -597,7 +617,9 @@ def adapt_regressor(regressor, features: torch.Tensor, boxes: torch.Tensor, args
     for _ in tqdm(range(int(args.gradient_steps)), desc="Adapting"):
         optimizer.zero_grad(set_to_none=True)
         output = regressor(features)
-        loss_count = float(args.weight_mincount) * MincountLoss(output, boxes, use_gpu=use_gpu)
+        loss_count = float(args.weight_mincount) * MincountLoss(
+            output, boxes, use_gpu=use_gpu
+        )
         loss_perturb = float(args.weight_perturbation) * PerturbationLoss(
             output, boxes, sigma=8, use_gpu=use_gpu
         )
@@ -625,7 +647,10 @@ def run_famnet(
         raise RuntimeError("No exemplar boxes found; cannot run FamNet.")
 
     output_dir = Path(args.output_dir)
-    cache_name = cache_name or f"density_day{getattr(args, 'day_for_ranking', 0)}_adapt{int(args.adapt)}.pt"
+    cache_name = (
+        cache_name
+        or f"density_day{getattr(args, 'day_for_ranking', 0)}_adapt{int(args.adapt)}.pt"
+    )
     cache_path = output_dir / cache_name
     if load_density and cache_path.exists():
         output = torch.load(cache_path, map_location=device)
@@ -635,9 +660,11 @@ def run_famnet(
         return np.asarray(out, dtype=np.float32)
 
     img = minmax_scale(feature_image)
-    img_3ch = img # np.stack([img, img, img], axis=-1)
+    img_3ch = img  # np.stack([img, img, img], axis=-1)
     pil_img = Image.fromarray(np.uint8(np.clip(img_3ch, 0.0, 1.0) * 255))
-    sample = Transform({"image": pil_img, "lines_boxes": [list(map(int, b)) for b in boxes]})
+    sample = Transform(
+        {"image": pil_img, "lines_boxes": [list(map(int, b)) for b in boxes]}
+    )
     t_image = sample["image"].unsqueeze(0).to(device)
     t_boxes = sample["boxes"].unsqueeze(0).to(device)
 
@@ -705,7 +732,9 @@ def compute_rgb_indices(xn: np.ndarray) -> Dict[str, np.ndarray]:
     return {name: minmax_scale(values) for name, values in indices.items()}
 
 
-def build_candidate_features(xn: np.ndarray, indices: Mapping[str, np.ndarray] | None = None, day: int = 0) -> Dict[str, np.ndarray]:
+def build_candidate_features(
+    xn: np.ndarray, indices: Mapping[str, np.ndarray] | None = None, day: int = 0
+) -> Dict[str, np.ndarray]:
     """Build candidate feature maps for multispectral or RGB image stacks."""
     x = np.asarray(xn, dtype=np.float32)
     if x.ndim != 4:
@@ -720,7 +749,11 @@ def build_candidate_features(xn: np.ndarray, indices: Mapping[str, np.ndarray] |
         return out
 
     if x.shape[-1] == 3:
-        out = {"Red": x[day, :, :, 0], "Green": x[day, :, :, 1], "Blue": x[day, :, :, 2]}
+        out = {
+            "Red": x[day, :, :, 0],
+            "Green": x[day, :, :, 1],
+            "Blue": x[day, :, :, 2],
+        }
         idx = indices if indices is not None else compute_rgb_indices(x)
         out.update({name: values[day] for name, values in idx.items()})
         return out
@@ -750,7 +783,9 @@ def compute_rgb_vegetation_mask(
     exg = 2.0 * g - r - b
     vari = safe_div(g - r, g + r - b)
     gli = safe_div(2.0 * g - r - b, 2.0 * g + r + b)
-    score = 0.55 * minmax_scale(exg) + 0.30 * minmax_scale(vari) + 0.15 * minmax_scale(gli)
+    score = (
+        0.55 * minmax_scale(exg) + 0.30 * minmax_scale(vari) + 0.15 * minmax_scale(gli)
+    )
     score8 = np.uint8(np.clip(score, 0.0, 1.0) * 255)
 
     if use_otsu:
@@ -796,11 +831,18 @@ def compute_shadow_removal_mask(
     blue, green, red, red_edge, nir = (img[..., i] for i in range(5))
     visible_brightness = (blue + green + red) / 3.0
     finite = np.isfinite(visible_brightness) & np.isfinite(nir) & np.isfinite(red_edge)
-    veg = np.ones(img.shape[:2], dtype=bool) if vegetation_mask is None else np.asarray(vegetation_mask, dtype=bool)
+    veg = (
+        np.ones(img.shape[:2], dtype=bool)
+        if vegetation_mask is None
+        else np.asarray(vegetation_mask, dtype=bool)
+    )
     valid = finite & veg
     if not np.any(valid):
         keep = np.zeros(img.shape[:2], dtype=np.uint8)
-        return keep, {"shadow_mask": np.ones(img.shape[:2], dtype=bool), "vegetation_mask": veg}
+        return keep, {
+            "shadow_mask": np.ones(img.shape[:2], dtype=bool),
+            "vegetation_mask": veg,
+        }
 
     valid_vis = visible_brightness[valid]
     valid_nir = nir[valid]
@@ -829,7 +871,9 @@ def compute_shadow_removal_mask(
 
     # Strict comparisons avoid classifying all pixels as shadow when many values
     # are tied exactly at the percentile threshold.
-    shadow = (visible_brightness < vis_thr) & (nir < nir_thr) & (red_edge < re_thr) & valid
+    shadow = (
+        (visible_brightness < vis_thr) & (nir < nir_thr) & (red_edge < re_thr) & valid
+    )
     shadow_fraction = float(shadow.sum() / max(int(valid.sum()), 1))
 
     if shadow_fraction > float(max_shadow_fraction):
@@ -913,14 +957,17 @@ def compute_scene_vegetation_mask(
     """Unified vegetation mask for multispectral or RGB inputs."""
     img = np.asarray(scene_image, dtype=np.float32)
     if mask_mode == "all":
-        return np.ones(img.shape[:2], dtype=np.uint8), np.ones(img.shape[:2], dtype=np.float32)
+        return np.ones(img.shape[:2], dtype=np.uint8), np.ones(
+            img.shape[:2], dtype=np.float32
+        )
     if mask_mode != "auto":
         raise ValueError("mask_mode must be 'auto' or 'all'")
 
     if input_mode == "multispectral":
-        return compute_ground_removal_mask(
-            img[:, :, :5], method=ground_method, use_otsu=True, remove_shadow=remove_shadow
-        )
+        # return compute_ground_removal_mask(
+        #    img[:, :, :5], method=ground_method, use_otsu=True, remove_shadow=remove_shadow
+        # )
+        return compute_rgb_vegetation_mask(img[:, :, :3], use_otsu=True)
     if input_mode == "rgb":
         return compute_rgb_vegetation_mask(img[:, :, :3], use_otsu=True)
     raise ValueError(f"Unsupported input_mode: {input_mode}")
@@ -949,7 +996,9 @@ def mask_bright_spots(
     return masks
 
 
-def compute_feature_metrics(feature_img: np.ndarray, mask: np.ndarray, eps: float = 1e-8) -> Dict[str, float]:
+def compute_feature_metrics(
+    feature_img: np.ndarray, mask: np.ndarray, eps: float = 1e-8
+) -> Dict[str, float]:
     """Score how well a candidate map separates detected bright blobs."""
     x = np.asarray(feature_img, dtype=np.float32)
     m = np.asarray(mask) > 0
@@ -958,8 +1007,12 @@ def compute_feature_metrics(feature_img: np.ndarray, mask: np.ndarray, eps: floa
     inside = inside[np.isfinite(inside)]
     outside = outside[np.isfinite(outside)]
 
-    n_labels, _, stats, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
-    blob_areas = stats[1:, cv2.CC_STAT_AREA] if n_labels > 1 else np.array([], dtype=np.int32)
+    n_labels, _, stats, _ = cv2.connectedComponentsWithStats(
+        m.astype(np.uint8), connectivity=8
+    )
+    blob_areas = (
+        stats[1:, cv2.CC_STAT_AREA] if n_labels > 1 else np.array([], dtype=np.int32)
+    )
     base = {
         "bright_fraction": float(m.mean()),
         "n_blobs": int(len(blob_areas)),
@@ -976,7 +1029,8 @@ def compute_feature_metrics(feature_img: np.ndarray, mask: np.ndarray, eps: floa
         **base,
         "contrast_ratio": (mu_in - mu_out) / (abs(mu_out) + eps),
         "effect_size": (mu_in - mu_out) / (pooled_std + eps),
-        "fisher_score": (mu_in - mu_out) ** 2 / (std_in * std_in + std_out * std_out + eps),
+        "fisher_score": (mu_in - mu_out) ** 2
+        / (std_in * std_in + std_out * std_out + eps),
     }
 
 
@@ -1005,8 +1059,12 @@ def detect_big_round_blobs(
 ) -> Tuple[np.ndarray, List[dict], List[np.ndarray]]:
     """Keep connected components that look like compact round crown exemplars."""
     bw = (np.asarray(mask) > 0).astype(np.uint8) * 255
-    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    bw = cv2.morphologyEx(
+        bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    )
+    bw = cv2.morphologyEx(
+        bw, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    )
     contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     kept_mask = np.zeros_like(bw)
@@ -1032,11 +1090,16 @@ def detect_big_round_blobs(
     return kept_mask, info, kept
 
 
-def top_k_blobs(blob_info: Sequence[dict], contours: Sequence[np.ndarray], k: int) -> Tuple[List[dict], List[np.ndarray]]:
+def top_k_blobs(
+    blob_info: Sequence[dict], contours: Sequence[np.ndarray], k: int
+) -> Tuple[List[dict], List[np.ndarray]]:
     """Return the k highest area*circularity blobs."""
     if not blob_info or not contours:
         return [], []
-    scores = np.asarray([float(b["area"]) * float(b["circularity"]) for b in blob_info], dtype=np.float32)
+    scores = np.asarray(
+        [float(b["area"]) * float(b["circularity"]) for b in blob_info],
+        dtype=np.float32,
+    )
     idx = np.argsort(scores)[::-1][: int(k)]
     return [blob_info[i] for i in idx], [contours[i] for i in idx]
 
@@ -1154,7 +1217,11 @@ def sample_seed_clusters_from_peaks(
     if len(radii_arr) != len(peaks):
         raise ValueError(f"Expected {len(peaks)} radii, got {len(radii_arr)}")
 
-    veg = np.ones((h, w), dtype=bool) if vegetation_mask is None else np.asarray(vegetation_mask, dtype=bool)
+    veg = (
+        np.ones((h, w), dtype=bool)
+        if vegetation_mask is None
+        else np.asarray(vegetation_mask, dtype=bool)
+    )
     clusters: List[np.ndarray] = []
     valid_peaks: List[List[int]] = []
     valid_radii: List[float] = []
@@ -1164,10 +1231,16 @@ def sample_seed_clusters_from_peaks(
         row, col = int(peak[0]), int(peak[1])
         if not (0 <= row < h and 0 <= col < w):
             continue
-        seed_radius = max(float(min_seed_radius), float(radius) * float(radius_fraction))
+        seed_radius = max(
+            float(min_seed_radius), float(radius) * float(radius_fraction)
+        )
         area = math.pi * seed_radius * seed_radius
         pts_xy = sample_points_in_circle_xy(
-            (float(col), float(row)), area, int(num_points), (h, w), seed=int(rng.integers(0, 2**31 - 1))
+            (float(col), float(row)),
+            area,
+            int(num_points),
+            (h, w),
+            seed=int(rng.integers(0, 2**31 - 1)),
         )
         pts_rc = xy_to_rc(pts_xy)
         if pts_rc.size == 0:
@@ -1184,10 +1257,16 @@ def sample_seed_clusters_from_peaks(
         valid_peaks.append([row, col])
         valid_radii.append(float(radius))
 
-    return clusters, np.asarray(valid_peaks, dtype=np.int32), np.asarray(valid_radii, dtype=np.float32)
+    return (
+        clusters,
+        np.asarray(valid_peaks, dtype=np.int32),
+        np.asarray(valid_radii, dtype=np.float32),
+    )
 
 
-def make_circle_mask(shape: Tuple[int, int], center_rc: Sequence[int | float], radius: int | float) -> np.ndarray:
+def make_circle_mask(
+    shape: Tuple[int, int], center_rc: Sequence[int | float], radius: int | float
+) -> np.ndarray:
     """Create a boolean disk mask."""
     h, w = shape
     mask = np.zeros((h, w), dtype=np.uint8)
@@ -1235,12 +1314,16 @@ def grow_peak_circles_until_collision(
     h, w = veg.shape
     k = len(peaks)
     if k == 0:
-        return np.zeros((h, w), dtype=np.int32), [], {
-            "vegetation_mask": veg,
-            "non_vegetation_mask": ~veg,
-            "vegetation_index": vegetation_index,
-            "history": [],
-        }
+        return (
+            np.zeros((h, w), dtype=np.int32),
+            [],
+            {
+                "vegetation_mask": veg,
+                "non_vegetation_mask": ~veg,
+                "vegetation_index": vegetation_index,
+                "history": [],
+            },
+        )
     if not (0.0 <= float(max_intersection_frac) <= 1.0):
         raise ValueError("max_intersection_frac must be between 0 and 1")
     if max_radius is None:
@@ -1280,15 +1363,17 @@ def grow_peak_circles_until_collision(
             elif proposed[i] >= int(max_radius):
                 stop_now[i] = True
                 stop_reasons[i] = "max_radius"
-            records.append({
-                "circle_id": int(i + 1),
-                "radius": int(proposed[i]),
-                "area": area,
-                "nonveg_frac": nonveg_frac,
-                "overlap_frac": overlap_frac,
-                "stop": bool(stop_now[i]),
-                "reason": stop_reasons[i] if stop_now[i] else "active",
-            })
+            records.append(
+                {
+                    "circle_id": int(i + 1),
+                    "radius": int(proposed[i]),
+                    "area": area,
+                    "nonveg_frac": nonveg_frac,
+                    "overlap_frac": overlap_frac,
+                    "stop": bool(stop_now[i]),
+                    "reason": stop_reasons[i] if stop_now[i] else "active",
+                }
+            )
 
         for i in range(k):
             if active[i] and not stop_now[i]:
@@ -1307,24 +1392,32 @@ def grow_peak_circles_until_collision(
     circle_info: List[dict] = []
     for i, mask in enumerate(final_masks):
         area = int(mask.sum())
-        circle_info.append({
-            "circle_id": int(i + 1),
-            "center_rc": tuple(map(int, peaks[i])),
-            "radius": int(radii[i]),
-            "area": area,
-            "vegetated_area": int((mask & veg).sum()),
-            "nonveg_frac": float((mask & nonveg).sum() / max(area, 1)),
-            "overlap_frac": float((mask & (final_overlaps > 1)).sum() / max(area, 1)),
-            "stop_reason": stop_reasons[i],
-        })
+        circle_info.append(
+            {
+                "circle_id": int(i + 1),
+                "center_rc": tuple(map(int, peaks[i])),
+                "radius": int(radii[i]),
+                "area": area,
+                "vegetated_area": int((mask & veg).sum()),
+                "nonveg_frac": float((mask & nonveg).sum() / max(area, 1)),
+                "overlap_frac": float(
+                    (mask & (final_overlaps > 1)).sum() / max(area, 1)
+                ),
+                "stop_reason": stop_reasons[i],
+            }
+        )
 
-    return labels, circle_info, {
-        "vegetation_mask": veg,
-        "non_vegetation_mask": nonveg,
-        "vegetation_index": vegetation_index,
-        "circle_masks": final_masks,
-        "history": history,
-    }
+    return (
+        labels,
+        circle_info,
+        {
+            "vegetation_mask": veg,
+            "non_vegetation_mask": nonveg,
+            "vegetation_index": vegetation_index,
+            "circle_masks": final_masks,
+            "history": history,
+        },
+    )
 
 
 def build_cluster_neighborhood_masks(
@@ -1394,11 +1487,15 @@ def reduce_feature_cube(
     if int(train_rows.sum()) < max(2, n_components):
         train_rows = finite_rows
     if int(train_rows.sum()) < max(2, n_components):
-        return normalize_channels(np.nan_to_num(x[..., :n_components], nan=0.0, posinf=0.0, neginf=0.0))
+        return normalize_channels(
+            np.nan_to_num(x[..., :n_components], nan=0.0, posinf=0.0, neginf=0.0)
+        )
 
     train = flat[train_rows].astype(np.float64, copy=False)
     mean = train.mean(axis=0, keepdims=True)
-    filled_flat = np.nan_to_num(flat.astype(np.float64, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+    filled_flat = np.nan_to_num(
+        flat.astype(np.float64, copy=False), nan=0.0, posinf=0.0, neginf=0.0
+    )
 
     invalid_or_background = (~mask.ravel()) | (~finite_rows)
     if np.any(invalid_or_background):
@@ -1422,7 +1519,9 @@ def reduce_feature_cube(
                     f"expected {(c, n_components)}"
                 )
             projected = (filled_flat - mean) @ channel_factor
-            return normalize_channels(projected.reshape(h, w, n_components).astype(np.float32))
+            return normalize_channels(
+                projected.reshape(h, w, n_components).astype(np.float32)
+            )
 
         except Exception as exc:
             print(
@@ -1482,7 +1581,9 @@ def labels_to_bounding_boxes(labels: np.ndarray, min_area: int = 1) -> List[BBox
         rows, cols = np.where(lab == label_id)
         if len(rows) < int(min_area):
             continue
-        boxes.append([int(rows.min()), int(cols.min()), int(rows.max()), int(cols.max())])
+        boxes.append(
+            [int(rows.min()), int(cols.min()), int(rows.max()), int(cols.max())]
+        )
     return boxes
 
 
@@ -1591,7 +1692,14 @@ def plot_grown_circles_debug(
         r, c = info["center_rc"]
         radius = info["radius"]
         axes[3].add_patch(plt.Circle((c, r), radius, fill=False, linewidth=1.5))
-        axes[3].text(c, r, f"{info['circle_id']}\nr={radius}\n{info['stop_reason']}", fontsize=7, ha="center", va="center")
+        axes[3].text(
+            c,
+            r,
+            f"{info['circle_id']}\nr={radius}\n{info['stop_reason']}",
+            fontsize=7,
+            ha="center",
+            va="center",
+        )
     axes[3].set_title("Radius + stop reason")
     axes[3].axis("off")
 
@@ -1606,17 +1714,32 @@ def plot_grown_circles_debug(
         plt.close(fig)
 
 
-def visualize_output_and_save(input_, output, boxes, save_path, figsize=(20, 12), dots=None):
+def visualize_output_and_save(
+    input_, output, boxes, save_path, figsize=(20, 12), dots=None
+):
     """Original FamNet visualization utility retained for compatibility."""
-    pred_cnt = output.sum().item() if torch.is_tensor(output) else float(np.asarray(output).sum())
+    pred_cnt = (
+        output.sum().item()
+        if torch.is_tensor(output)
+        else float(np.asarray(output).sum())
+    )
     boxes = boxes.squeeze(0) if torch.is_tensor(boxes) else np.asarray(boxes)
     boxes2 = []
     for i in range(boxes.shape[0]):
-        y1, x1, y2, x2 = [int(boxes[i, j].item() if torch.is_tensor(boxes) else boxes[i, j]) for j in (1, 2, 3, 4)]
-        roi_cnt = output[0, 0, y1:y2, x1:x2].sum().item() if torch.is_tensor(output) else float(output[y1:y2, x1:x2].sum())
+        y1, x1, y2, x2 = [
+            int(boxes[i, j].item() if torch.is_tensor(boxes) else boxes[i, j])
+            for j in (1, 2, 3, 4)
+        ]
+        roi_cnt = (
+            output[0, 0, y1:y2, x1:x2].sum().item()
+            if torch.is_tensor(output)
+            else float(output[y1:y2, x1:x2].sum())
+        )
         boxes2.append([y1, x1, y2, x2, roi_cnt])
 
-    img1 = format_for_plotting(denormalize(input_) if torch.is_tensor(input_) else input_)
+    img1 = format_for_plotting(
+        denormalize(input_) if torch.is_tensor(input_) else input_
+    )
     output_img = format_for_plotting(output)
     if torch.is_tensor(img1):
         img1 = img1.numpy()
@@ -1628,8 +1751,22 @@ def visualize_output_and_save(input_, output, boxes, save_path, figsize=(20, 12)
     ax.set_axis_off()
     ax.imshow(np.clip(img1, 0.0, 1.0))
     for y1, x1, y2, x2, _ in boxes2:
-        ax.add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=3, edgecolor="y", facecolor="none"))
-        ax.add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=1, edgecolor="k", linestyle="--", facecolor="none"))
+        ax.add_patch(
+            patches.Rectangle(
+                (x1, y1), x2 - x1, y2 - y1, linewidth=3, edgecolor="y", facecolor="none"
+            )
+        )
+        ax.add_patch(
+            patches.Rectangle(
+                (x1, y1),
+                x2 - x1,
+                y2 - y1,
+                linewidth=1,
+                edgecolor="k",
+                linestyle="--",
+                facecolor="none",
+            )
+        )
     if dots is not None:
         ax.scatter(dots[:, 0], dots[:, 1], c="red", edgecolors="blue")
         ax.set_title(f"Input image, gt count: {dots.shape[0]}")
@@ -1653,8 +1790,22 @@ def visualize_output_and_save(input_, output, boxes, save_path, figsize=(20, 12)
     ax.set_title(f"Density map, predicted count: {pred_cnt:.2f}")
     ret_fig = ax.imshow(output_img)
     for y1, x1, y2, x2, roi_cnt in boxes2:
-        ax.add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=3, edgecolor="y", facecolor="none"))
-        ax.add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=1, edgecolor="k", linestyle="--", facecolor="none"))
+        ax.add_patch(
+            patches.Rectangle(
+                (x1, y1), x2 - x1, y2 - y1, linewidth=3, edgecolor="y", facecolor="none"
+            )
+        )
+        ax.add_patch(
+            patches.Rectangle(
+                (x1, y1),
+                x2 - x1,
+                y2 - y1,
+                linewidth=1,
+                edgecolor="k",
+                linestyle="--",
+                facecolor="none",
+            )
+        )
         ax.text(x1, y1, f"{roi_cnt:.2f}", backgroundcolor="y")
     fig.colorbar(ret_fig, ax=ax)
     fig.savefig(save_path, bbox_inches="tight")
@@ -1748,6 +1899,7 @@ def non_max_suppression_boxes(
             break
 
     return keep
+
 
 def save_clustered_tree_crown_patches(
     image_rgb: np.ndarray,
@@ -1879,6 +2031,7 @@ def save_clustered_tree_crown_patches(
 
     return metadata
 
+
 def load_patch_records(
     patch_library_dir: str | Path,
     *,
@@ -1912,7 +2065,9 @@ def load_patch_records(
     else:
         # Fallback: load any *_rgb.png files even if metadata is absent.
         for rgb_path in sorted(root.glob("*_rgb.png")):
-            mask_path = rgb_path.with_name(rgb_path.name.replace("_rgb.png", "_mask.png"))
+            mask_path = rgb_path.with_name(
+                rgb_path.name.replace("_rgb.png", "_mask.png")
+            )
             records.append(
                 {
                     "patch_id": rgb_path.stem.replace("_rgb", ""),
@@ -2153,6 +2308,7 @@ def write_patch_match_file(
         for match in matches:
             fout.write(json.dumps(dict(match)) + "\n")
 
+
 def boxes_to_seed_clusters_rc(
     boxes: Sequence[Sequence[int | float]],
     image_shape: Tuple[int, int],
@@ -2197,6 +2353,7 @@ def boxes_to_seed_clusters_rc(
         seed_clusters.append(np.asarray(points, dtype=np.int32))
 
     return seed_clusters
+
 
 def filter_boxes_by_mean_area(
     boxes: Sequence[Sequence[int | float]],
@@ -2250,10 +2407,7 @@ def filter_boxes_by_mean_area(
         }
 
     areas = np.asarray(
-        [
-            max(0, y2 - y1 + 1) * max(0, x2 - x1 + 1)
-            for y1, x1, y2, x2 in clean_boxes
-        ],
+        [max(0, y2 - y1 + 1) * max(0, x2 - x1 + 1) for y1, x1, y2, x2 in clean_boxes],
         dtype=np.float32,
     )
 
@@ -2279,10 +2433,7 @@ def filter_boxes_by_mean_area(
         keep_mask[:] = False
         keep_mask[keep_indices] = True
 
-    filtered_boxes = [
-        box for box, keep in zip(clean_boxes, keep_mask)
-        if bool(keep)
-    ]
+    filtered_boxes = [box for box, keep in zip(clean_boxes, keep_mask) if bool(keep)]
 
     info = {
         "mean_area": mean_area,
@@ -2307,13 +2458,11 @@ def detect_closed_boundary_boxes(
     gaussian_sigma: float = 1.2,
     threshold_method: str = "otsu",
     threshold_percentile: float = 80.0,
-
     # Important change:
     # Closing is now local per connected edge object, not global.
     local_close_kernel_size: int = 5,
     local_close_iterations: int = 1,
     fill_holes: bool = True,
-
     min_area: float = 40.0,
     max_area: float | None = None,
     min_width: int = 4,
@@ -2321,13 +2470,11 @@ def detect_closed_boundary_boxes(
     min_circularity: float = 0.10,
     min_solidity: float = 0.30,
     border_margin: int = 1,
-
     # New mean-area filtering.
     filter_by_mean_area: bool = True,
     area_std_factor: float = 1.0,
     area_ratio_range: Tuple[float, float] | None = (0.4, 2.5),
     min_area_filter_keep: int = 1,
-
     return_debug: bool = False,
     plot: bool = False,
     plot_save_path: str | None = None,
@@ -2552,10 +2699,7 @@ def detect_closed_boundary_boxes(
         min_box_area = 0.0
     else:
         min_box_area = float(
-            min(
-                (y2 - y1 + 1) * (x2 - x1 + 1)
-                for y1, x1, y2, x2 in boxes
-            )
+            min((y2 - y1 + 1) * (x2 - x1 + 1) for y1, x1, y2, x2 in boxes)
         )
 
     debug = {
@@ -2589,7 +2733,6 @@ def detect_closed_boundary_boxes(
         return boxes, min_box_area, debug
 
     return boxes, min_box_area
-
 
 
 def build_sobel_gradient_image(
@@ -2632,9 +2775,7 @@ def build_sobel_gradient_image(
     else:
         weights = np.asarray(channel_weights, dtype=np.float32).reshape(-1)
         if len(weights) != c:
-            raise ValueError(
-                f"Expected {c} channel weights, got {len(weights)}"
-            )
+            raise ValueError(f"Expected {c} channel weights, got {len(weights)}")
         weights = weights / max(float(np.sum(np.abs(weights))), 1e-8)
 
     gradient = np.zeros((h, w), dtype=np.float32)
@@ -2666,6 +2807,7 @@ def build_sobel_gradient_image(
 
     gradient = minmax_scale(gradient)
     return gradient.astype(np.float32)
+
 
 def plot_closed_boundary_detection(
     image: np.ndarray,
@@ -2774,7 +2916,3 @@ def plot_closed_boundary_detection(
         plt.show()
     else:
         plt.close(fig)
-
-
-
-
